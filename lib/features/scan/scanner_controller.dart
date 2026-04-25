@@ -3,7 +3,7 @@ import 'dart:typed_data';
 import 'dart:ui' show Size;
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart' show WriteBuffer;
+import 'package:flutter/foundation.dart' show WriteBuffer, debugPrint;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 
@@ -120,31 +120,53 @@ class ScannerController extends StateNotifier<ScannerState> {
 
     _lastSampleAt = now;
     _isProcessing = true;
+    debugPrint('[Scanner] ▶ frame sampled — ${image.width}×${image.height} fmt=${image.format.raw} planes=${image.planes.length}');
     _analyseFrame(image).whenComplete(() => _isProcessing = false);
   }
 
   Future<void> _analyseFrame(CameraImage image) async {
     final inputImage = _toInputImage(image);
-    if (inputImage == null) return;
+    if (inputImage == null) {
+      debugPrint('[Scanner] ✗ _toInputImage returned null (unsupported format?)');
+      return;
+    }
 
     final recognizedText = await _recognizer.processImage(inputImage);
-    final hints = OcrExtractor.extract(recognizedText.text);
+    final raw = recognizedText.text.trim();
 
-    if (hints == null) {
+    if (raw.isEmpty) {
+      debugPrint('[Scanner] ~ OCR: (empty)');
       _resetStability();
       return;
     }
 
+    // Print only the first 200 chars to keep logs readable.
+    final preview = raw.length > 200 ? '${raw.substring(0, 200)}…' : raw;
+    debugPrint('[Scanner] OCR text:\n"""\n$preview\n"""');
+
+    final hints = OcrExtractor.extract(raw);
+
+    if (hints == null) {
+      debugPrint('[Scanner] ~ OcrExtractor: no usable hints extracted');
+      _resetStability();
+      return;
+    }
+
+    debugPrint('[Scanner] hints → $hints');
+
     // Accumulate consecutive readings of the same card.
     if (hints.matches(_candidateHints)) {
       _consecutiveCount++;
+      debugPrint('[Scanner] stability: $_consecutiveCount/$_stabilityThreshold');
     } else {
       _candidateHints = hints;
       _consecutiveCount = 1;
+      debugPrint('[Scanner] new candidate: $hints (reset counter)');
     }
 
     if (_consecutiveCount >= _stabilityThreshold) {
       // Stable reading detected — stop further processing and resolve.
+      debugPrint('[Scanner] ✓ stable — calling resolve');
       final stable = _candidateHints!;
       _resetStability();
       await _resolveCard(stable);
@@ -152,12 +174,15 @@ class ScannerController extends StateNotifier<ScannerState> {
   }
 
   Future<void> _resolveCard(ScanHints hints) async {
+    debugPrint('[Scanner] → POST /cards/resolve  hints=$hints');
     state = state.copyWith(phase: ScanPhase.processing, lastHints: hints);
 
     try {
       final result = await _repository.resolve(hints);
+      debugPrint('[Scanner] ← resolve status=${result.status.name}');
       state = state.copyWith(phase: ScanPhase.resolved, result: result);
     } catch (e) {
+      debugPrint('[Scanner] ✗ resolve error: $e');
       state = state.copyWith(
         phase: ScanPhase.error,
         errorMessage: e.toString(),
@@ -191,7 +216,10 @@ class ScannerController extends StateNotifier<ScannerState> {
             InputImageRotation.rotation0deg;
 
     final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
+    if (format == null) {
+      debugPrint('[Scanner] ✗ unknown image format raw=${image.format.raw}');
+      return null;
+    }
 
     // iOS uses a single BGRA plane; Android NV21 uses two planes.
     final Uint8List bytes;

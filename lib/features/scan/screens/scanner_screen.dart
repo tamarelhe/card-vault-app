@@ -69,9 +69,10 @@ class _ScannerScreenState extends ConsumerState<ScannerScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Camera preview
+          // Camera preview — iOS sensor is landscape so previewSize is (W, H)
+          // in landscape order; we swap to fill portrait screen without distortion.
           if (controller != null && controller.value.isInitialized)
-            CameraPreview(controller)
+            _buildCameraPreview(controller)
           else
             const Center(
               child: CircularProgressIndicator(color: Colors.white),
@@ -90,6 +91,31 @@ class _ScannerScreenState extends ConsumerState<ScannerScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Builds the camera preview filling the screen without distortion.
+  ///
+  /// On iOS the sensor reports its native size in landscape (e.g. 1280×720),
+  /// so we swap width↔height to get the correct portrait aspect ratio, then
+  /// scale to cover the full screen.
+  Widget _buildCameraPreview(CameraController controller) {
+    final previewSize = controller.value.previewSize;
+    if (previewSize == null) return CameraPreview(controller);
+
+    // Swap dimensions: iOS native size is landscape; phone is portrait.
+    final portraitWidth = previewSize.height;
+    final portraitHeight = previewSize.width;
+
+    return SizedBox.expand(
+      child: FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: portraitWidth,
+          height: portraitHeight,
+          child: CameraPreview(controller),
+        ),
       ),
     );
   }

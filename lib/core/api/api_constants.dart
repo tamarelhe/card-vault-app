@@ -5,7 +5,7 @@ class ApiConstants {
   ApiConstants._();
 
   /// Local development backend.
-  static const String baseUrl = 'http://localhost:8080';
+  static const String baseUrl = 'http://192.168.68.111:8080';
 
   // Auth
   static const String register = '/api/v1/auth/register';
