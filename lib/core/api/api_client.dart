@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import '../api/api_constants.dart';
 import '../auth/token_storage.dart';
 
@@ -18,8 +19,33 @@ Dio buildDio(TokenStorage storage) {
   );
 
   dio.interceptors.add(_AuthInterceptor(dio, storage));
+  if (ApiConstants.logHttp) dio.interceptors.add(_LoggingInterceptor());
 
   return dio;
+}
+
+/// Logs every HTTP request and response when [ApiConstants.logHttp] is true.
+class _LoggingInterceptor extends Interceptor {
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    debugPrint('[HTTP] → ${options.method} ${options.uri}');
+    if (options.data != null) debugPrint('[HTTP]   body: ${options.data}');
+    handler.next(options);
+  }
+
+  @override
+  void onResponse(Response response, ResponseInterceptorHandler handler) {
+    debugPrint('[HTTP] ← ${response.statusCode} ${response.requestOptions.uri}');
+    debugPrint('[HTTP]   body: ${response.data}');
+    handler.next(response);
+  }
+
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    debugPrint('[HTTP] ✗ ${err.response?.statusCode} ${err.requestOptions.uri}');
+    if (err.response?.data != null) debugPrint('[HTTP]   error: ${err.response?.data}');
+    handler.next(err);
+  }
 }
 
 /// Intercepts every request to inject the Bearer token, and retries once on 401.

@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
 import '../../core/api/api_constants.dart';
+import '../../core/models/collection_card_model.dart';
 import '../../core/models/collection_model.dart';
 
 /// Handles all collection-related API calls.
@@ -35,5 +36,33 @@ class CollectionsRepository {
   /// Deletes a collection by ID.
   Future<void> deleteCollection(String id) async {
     await _dio.delete<void>('${ApiConstants.collections}/$id');
+  }
+
+  /// Returns a paginated list of cards in [collectionId].
+  ///
+  /// All filter and sort parameters map directly to the API query params.
+  Future<CollectionCardListResponse> listCollectionCards(
+    String collectionId, {
+    String? query,
+    String? setCode,
+    String? cardType,
+    String sortBy = 'name',
+    String sortOrder = 'asc',
+    int page = 1,
+    int pageSize = 20,
+  }) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      ApiConstants.collectionCards(collectionId),
+      queryParameters: {
+        if (query != null && query.isNotEmpty) 'q': query,
+        if (setCode != null && setCode.isNotEmpty) 'set_code': setCode,
+        if (cardType != null && cardType.isNotEmpty) 'card_type': cardType,
+        'sort_by': sortBy,
+        'sort_order': sortOrder,
+        'page': page,
+        'page_size': pageSize,
+      },
+    );
+    return CollectionCardListResponse.fromJson(response.data!);
   }
 }

@@ -30,6 +30,15 @@ class ScanHints {
     return false;
   }
 
+  /// Returns a new [ScanHints] combining non-null fields from this and [other].
+  ///
+  /// Prefers non-null values from [other] so that a richer later frame wins.
+  ScanHints mergeWith(ScanHints other) => ScanHints(
+        name: other.name ?? name,
+        setCode: other.setCode ?? setCode,
+        collectorNumber: other.collectorNumber ?? collectorNumber,
+      );
+
   Map<String, dynamic> toJson() => {
         if (name != null) 'name': name,
         if (setCode != null) 'set_code': setCode,

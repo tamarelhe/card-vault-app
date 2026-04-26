@@ -1,16 +1,10 @@
 import 'package:flutter/material.dart';
 import '../scanner_controller.dart';
 
-// Viewfinder geometry constants — must stay in sync with the identically-named
-// constants in scanner_controller.dart (_kCardAspect, _kViewfinderWidth, _kBottomPadding).
-const _kCardAspect = 63.0 / 88.0;
-const _kViewfinderWidth = 0.75;
-const _kBottomPadding = 0.03;
-
 /// Transparent overlay drawn on top of the camera preview.
 ///
-/// Shows a card-shaped viewfinder rectangle and a status message
-/// reflecting the current [ScanPhase].
+/// Shows a status message reflecting the current [ScanPhase].
+/// The full screen is available for scanning — no viewfinder rectangle is drawn.
 class ScanOverlay extends StatelessWidget {
   final ScanPhase phase;
 
@@ -21,9 +15,6 @@ class ScanOverlay extends StatelessWidget {
     return Stack(
       fit: StackFit.expand,
       children: [
-        // Dark vignette around the viewfinder
-        CustomPaint(painter: _VignettePainter()),
-
         // Status label at the bottom
         Positioned(
           bottom: 48,
@@ -60,45 +51,3 @@ class ScanOverlay extends StatelessWidget {
   }
 }
 
-/// Paints a semi-transparent vignette with a transparent card-shaped cutout.
-class _VignettePainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final cardW = size.width * _kViewfinderWidth;
-    // Include the same bottom padding used by the OCR crop so the visual frame
-    // matches the area that is actually analysed.
-    final cardH = cardW / _kCardAspect * (1 + _kBottomPadding);
-    final cardRect = RRect.fromRectAndRadius(
-      Rect.fromCenter(
-        center: Offset(size.width / 2, size.height / 2),
-        width: cardW,
-        height: cardH,
-      ),
-      const Radius.circular(8),
-    );
-
-    // Outer dark overlay
-    final outer = Path()..addRect(Rect.fromLTWH(0, 0, size.width, size.height));
-    // Cutout
-    final inner = Path()..addRRect(cardRect);
-    // Subtract the cutout from the overlay
-    final vignette = Path.combine(PathOperation.difference, outer, inner);
-
-    canvas.drawPath(
-      vignette,
-      Paint()..color = Colors.black.withAlpha(140),
-    );
-
-    // Draw viewfinder border
-    canvas.drawRRect(
-      cardRect,
-      Paint()
-        ..color = Colors.white.withAlpha(200)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2,
-    );
-  }
-
-  @override
-  bool shouldRepaint(_VignettePainter old) => false;
-}

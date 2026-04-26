@@ -2,9 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import 'core/models/collection_model.dart';
 import 'core/providers.dart';
 import 'features/auth/screens/login_screen.dart';
 import 'features/auth/screens/register_screen.dart';
+import 'features/collections/screens/collection_detail_screen.dart';
+import 'features/collections/screens/create_collection_screen.dart';
 import 'features/home/home_screen.dart';
 
 /// Root application widget — configures the theme and router.
@@ -61,6 +64,16 @@ class CardVaultApp extends ConsumerWidget {
         GoRoute(
           path: '/register',
           builder: (ctx, _) => const RegisterScreen(),
+        ),
+        GoRoute(
+          path: '/collections/new',
+          builder: (ctx, _) => const CreateCollectionScreen(),
+        ),
+        GoRoute(
+          path: '/collections/:id',
+          builder: (ctx, state) => CollectionDetailScreen(
+            collection: state.extra as CollectionModel,
+          ),
         ),
       ],
     );

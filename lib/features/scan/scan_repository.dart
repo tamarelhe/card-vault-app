@@ -42,7 +42,14 @@ class ScanRepository {
   ) async {
     final response = await _dio.post<Map<String, dynamic>>(
       '${ApiConstants.scanSessions}/$sessionId/items',
-      data: hints.toJson(),
+      data: {
+        ...hints.toJson(),
+        'quantity': 1,
+        'condition': 'near_mint',
+        'language': 'en',
+        'foil': false,
+        'notes': '',
+      },
     );
     return response.data!;
   }

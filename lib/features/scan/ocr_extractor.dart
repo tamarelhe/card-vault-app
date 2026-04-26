@@ -17,8 +17,13 @@ class OcrExtractor {
   // fractions, which never have a 3-digit denominator.
   static final _strictCollector = RegExp(r'\b(\d{1,4})/\d{3,4}\b');
 
-  // Fallback: any 1-4 digit standalone number.
-  static final _looseCollector = RegExp(r'\b(\d{1,4})\b');
+  // MTG collector number with OCR-error-tolerant character class.
+  // Matches optional C/#  prefix (e.g. "CO578", "#0578") then 3-5 chars that
+  // could be digits or OCR mis-reads of digits (O→0, I→1, S→5, B→8, …).
+  static final _mtgCollectorLike = RegExp(
+    r'\b(?:[C#])?([0-9OQDILSB]{3,5})\b',
+    caseSensitive: false,
+  );
 
   // Set code: 2-5 uppercase alphanumeric chars, first char must be a letter.
   // Modern sets use exactly 3 chars; older ones used 2; some special sets
@@ -83,11 +88,11 @@ class OcrExtractor {
       }
     }
 
-    // Pass 3: lenient fallback — try bottom strip first, then all lines.
+    // Pass 3: OCR-tolerant fallback — scan all lines bottom-up.
     if (collectorNumber == null || setCode == null) {
       for (final line in [...bottomLines.reversed, ...allLines.reversed]) {
-        collectorNumber ??= _looseCollector.firstMatch(line)?.group(1);
-        setCode ??= _firstSetCode(line);
+        collectorNumber ??= _extractCollectorFromLine(line);
+        setCode ??= _extractSetCodeFromLine(line);
         if (collectorNumber != null && setCode != null) break;
       }
     }
@@ -113,11 +118,61 @@ class OcrExtractor {
       .where((l) => l.isNotEmpty)
       .toList();
 
+  /// Replaces common OCR mis-reads of digit characters.
+  static String _normalizeCollectorCandidate(String value) => value
+      .toUpperCase()
+      .replaceAll('O', '0')
+      .replaceAll('Q', '0')
+      .replaceAll('D', '0')
+      .replaceAll('I', '1')
+      .replaceAll('L', '1')
+      .replaceAll('S', '5')
+      .replaceAll('B', '8');
+
+  /// Extracts a collector number from [line], tolerating OCR digit errors.
+  ///
+  /// Handles formats such as `0578`, `O578`, `CO578`, `C0578`.
+  /// Skips obvious false positives like years (2024) and power/toughness.
+  static String? _extractCollectorFromLine(String line) {
+    final upper = line.toUpperCase();
+    for (final m in _mtgCollectorLike.allMatches(upper)) {
+      final raw = m.group(1);
+      if (raw == null) continue;
+      final normalized = _normalizeCollectorCandidate(raw);
+      if (!RegExp(r'^\d{3,5}$').hasMatch(normalized)) continue;
+      // Skip years (e.g. 2024).
+      if (normalized.startsWith('20') && normalized.length == 4) continue;
+      return normalized;
+    }
+    return null;
+  }
+
+  /// Extracts a set code from [line] using the language-code anchor.
+  ///
+  /// Only returns a value when the line contains a language code (e.g. `EN`),
+  /// looking for the token immediately before it (e.g. `J25 EN`).
+  /// Returns null when no anchor is found — this prevents false positives
+  /// from copyright lines and rules text.
+  static String? _extractSetCodeFromLine(String line) {
+    final upper = line.toUpperCase();
+    final beforeLang = RegExp(
+      r'\b([A-Z][A-Z0-9]{1,4})\s+(?:EN|DE|FR|IT|PT|ES|JP|KR|RU|CS|CT|PH|HE|AR)\b',
+    ).firstMatch(upper);
+    if (beforeLang != null) {
+      final code = beforeLang.group(1)!;
+      if (!_falsePositives.contains(code)) return code;
+    }
+    return null;
+  }
+
   /// Returns the first valid set-code token found in [line], or null.
+  ///
+  /// Requires at least 3 characters to avoid common 2-letter English words
+  /// (OF, IN, AT…) that appear in copyright lines and rules text.
   static String? _firstSetCode(String line) {
     for (final m in _setCodePattern.allMatches(line)) {
       final c = m.group(1)!;
-      if (c.length < 2) continue;
+      if (c.length < 3) continue;
       if (_languageCodes.contains(c)) continue;
       if (_falsePositives.contains(c)) continue;
       return c;

@@ -44,8 +44,7 @@ class _ScannerScreenState extends ConsumerState<ScannerScreen> {
   Future<void> _initCamera() async {
     final cameras = await availableCameras();
     if (!mounted) return;
-    final screenSize = MediaQuery.of(context).size;
-    await ref.read(scannerControllerProvider.notifier).initialize(cameras, screenSize);
+    await ref.read(scannerControllerProvider.notifier).initialize(cameras);
   }
 
   @override
@@ -155,7 +154,8 @@ class _ScannerScreenState extends ConsumerState<ScannerScreen> {
         }
 
       case ResolutionStatus.notFound:
-        _showError('Card not found in catalogue');
+        // do not display any error
+        //_showError('Card not found in catalogue');
         if (mounted) {
           ref.read(scannerControllerProvider.notifier).resumeScanning();
         }

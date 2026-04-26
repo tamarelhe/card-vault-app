@@ -5,7 +5,10 @@ class ApiConstants {
   ApiConstants._();
 
   /// Local development backend.
-  static const String baseUrl = 'http://192.168.68.111:8080';
+  static const String baseUrl = 'http://192.168.1.193:8080';
+
+  /// Set to true to print every HTTP request and response to the console.
+  static const bool logHttp = true;
 
   // Auth
   static const String register = '/api/v1/auth/register';
@@ -18,6 +21,9 @@ class ApiConstants {
 
   // Collections
   static const String collections = '/api/v1/collections';
+
+  /// Cards endpoint for a specific collection.
+  static String collectionCards(String id) => '$collections/$id/cards';
 
   // Scan sessions
   static const String scanSessions = '/api/v1/scan/sessions';
