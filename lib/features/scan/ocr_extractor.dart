@@ -6,30 +6,26 @@ import '../../core/models/scan_hints.dart';
 ///   `<collector_number>/<total> <set_code> · <lang>`
 ///   Example: `149/249 M10 · EN`
 ///
-/// The extractor uses a two-pass strategy:
-/// 1. **Bottom-strip pass** — looks for a line containing `digits/3-4digits`
-///    (distinguishes "149/249" from "3/3" power/toughness).  If found, the
-///    set code is extracted from that same line.
-/// 2. **Lenient fallback** — if no bottom-strip line is found (e.g., the total
-///    was cropped or OCR missed the slash), scans bottom-up with looser patterns.
+/// The preferred entry point is [extractWithPriority], which receives the
+/// full-card text and the bottom-strip text separately so the extractor can
+/// be more targeted about where to look for each field.
 class OcrExtractor {
   OcrExtractor._();
 
   // Bottom-strip collector number: requires a 3-4 digit total (≥100 cards in
-  // set).  This reliably excludes power/toughness ("3/3", "2/4") and CMC
+  // a set).  This reliably excludes power/toughness ("3/3", "2/4") and CMC
   // fractions, which never have a 3-digit denominator.
   static final _strictCollector = RegExp(r'\b(\d{1,4})/\d{3,4}\b');
 
   // Fallback: any 1-4 digit standalone number.
   static final _looseCollector = RegExp(r'\b(\d{1,4})\b');
 
-  // Set code: 2-5 uppercase alphanumeric characters, first char must be a
-  // letter.  Modern sets use exactly 3 chars; older sets used 2; some special
-  // sets use 4-5 (e.g., "PLST", "MB1").
+  // Set code: 2-5 uppercase alphanumeric chars, first char must be a letter.
+  // Modern sets use exactly 3 chars; older ones used 2; some special sets
+  // use 4-5 (e.g., "PLST", "MB1").
   static final _setCodePattern = RegExp(r'\b([A-Z][A-Z0-9]{1,4})\b');
 
-  // Language codes present on almost every card — must not be mistaken for a
-  // set code.
+  // Language codes present on almost every card — not set codes.
   static const _languageCodes = {
     'EN', 'DE', 'FR', 'IT', 'PT', 'ES', 'JP', 'KR',
     'RU', 'CS', 'CT', 'PH', 'HE', 'AR',
@@ -37,49 +33,59 @@ class OcrExtractor {
 
   // Common tokens from rules text or card frames that are not set codes.
   static const _falsePositives = {
-    'R', 'W', 'U', 'B', 'G', // mana symbols as text
-    'T', 'Q',                 // tap / untap symbols as text
-    'BB', 'WW', 'UU', 'RR',  // double mana
-    'CMC', 'CMR',             // sometimes appear in rules text
-    'LLC', 'TM',              // copyright line fragments
-    'THE', 'AND', 'FOR', 'NOT', 'ALL', // common English words OCR may emit
+    'R', 'W', 'U', 'B', 'G',        // mana symbols as text
+    'T', 'Q',                         // tap / untap symbols as text
+    'BB', 'WW', 'UU', 'RR',          // double mana
+    'CMC', 'CMR',                     // sometimes appear in rules text
+    'LLC', 'TM',                      // copyright line fragments
+    'THE', 'AND', 'FOR', 'NOT', 'ALL',
     'YOU', 'ITS', 'PUT', 'GET', 'HAS',
   };
 
-  /// Extracts [ScanHints] from [ocrText].
-  /// Returns null when there is no usable data.
-  static ScanHints? extract(String ocrText) {
-    if (ocrText.trim().isEmpty) return null;
+  /// Extracts [ScanHints] from two OCR regions:
+  ///
+  /// - [mainText]   — blocks from the full viewfinder (used for card name).
+  /// - [bottomText] — blocks from the bottom strip only (used first for set
+  ///                  code + collector number; more precise, less noise).
+  ///
+  /// Falls back to searching [mainText] when the bottom strip yields nothing.
+  static ScanHints? extractWithPriority(String mainText, String bottomText) {
+    final mainLines = _splitLines(mainText);
+    final bottomLines = _splitLines(bottomText);
+    final allLines = _splitLines('$mainText\n$bottomText');
 
-    final lines = ocrText
-        .split('\n')
-        .map((l) => l.trim())
-        .where((l) => l.isNotEmpty)
-        .toList();
+    if (allLines.isEmpty) return null;
 
-    if (lines.isEmpty) return null;
+    final name = _extractName(mainLines.isNotEmpty ? mainLines : allLines);
 
-    final name = _extractName(lines);
     String? collectorNumber;
     String? setCode;
 
-    // --- Pass 1: bottom-strip line -------------------------------------------
-    // A line that contains `digits/3-4digits` is almost certainly the bottom
-    // strip.  Extract both collector number and set code from that line.
-    for (final line in lines.reversed) {
+    // Pass 1: strict collector pattern in the dedicated bottom strip.
+    for (final line in bottomLines.reversed) {
       final m = _strictCollector.firstMatch(line);
       if (m != null) {
         collectorNumber = m.group(1);
-        setCode = _firstSetCode(line);
+        setCode ??= _firstSetCode(line);
         break;
       }
     }
 
-    // --- Pass 2: lenient fallback ---------------------------------------------
-    // Used when the bottom strip wasn't captured with a /total (e.g., promos,
-    // or OCR dropped the slash).
+    // Pass 2: strict collector pattern across all lines (bottom-up).
+    if (collectorNumber == null) {
+      for (final line in allLines.reversed) {
+        final m = _strictCollector.firstMatch(line);
+        if (m != null) {
+          collectorNumber = m.group(1);
+          setCode ??= _firstSetCode(line);
+          break;
+        }
+      }
+    }
+
+    // Pass 3: lenient fallback — try bottom strip first, then all lines.
     if (collectorNumber == null || setCode == null) {
-      for (final line in lines.reversed) {
+      for (final line in [...bottomLines.reversed, ...allLines.reversed]) {
         collectorNumber ??= _looseCollector.firstMatch(line)?.group(1);
         setCode ??= _firstSetCode(line);
         if (collectorNumber != null && setCode != null) break;
@@ -94,6 +100,18 @@ class OcrExtractor {
 
     return hints.hasEnoughData ? hints : null;
   }
+
+  /// Convenience wrapper — passes [ocrText] as [mainText] with no bottom strip.
+  static ScanHints? extract(String ocrText) =>
+      extractWithPriority(ocrText, '');
+
+  // ---------------------------------------------------------------------------
+
+  static List<String> _splitLines(String text) => text
+      .split('\n')
+      .map((l) => l.trim())
+      .where((l) => l.isNotEmpty)
+      .toList();
 
   /// Returns the first valid set-code token found in [line], or null.
   static String? _firstSetCode(String line) {

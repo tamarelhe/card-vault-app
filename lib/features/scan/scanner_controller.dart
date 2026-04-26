@@ -63,10 +63,13 @@ class ScannerState {
 ///
 /// Frame sampling strategy:
 /// 1. One frame every [_frameInterval] ms.
-/// 2. Run ML Kit OCR on the sampled frame.
-/// 3. Parse OCR output into [ScanHints] via [OcrExtractor].
-/// 4. Require [_stabilityThreshold] consecutive identical readings.
-/// 5. On stable → call [ScanRepository.resolve], transition to [ScanPhase.resolved].
+/// 2. Run ML Kit OCR on the full frame.
+/// 3. Filter [TextBlock]s to those whose bounding box falls inside the
+///    on-screen viewfinder rectangle — this is the ROI, and it works for
+///    any camera format (NV12, BGRA, NV21, …).
+/// 4. Parse OCR output into [ScanHints] via [OcrExtractor].
+/// 5. Require [_stabilityThreshold] consecutive identical readings.
+/// 6. On stable → call [ScanRepository.resolve], transition to [ScanPhase.resolved].
 class ScannerController extends StateNotifier<ScannerState> {
   final ScanRepository _repository;
 
@@ -89,12 +92,18 @@ class ScannerController extends StateNotifier<ScannerState> {
   ScanHints? _candidateHints;
   int _consecutiveCount = 0;
 
+  // Viewfinder geometry constants — must stay in sync with scan_overlay.dart.
+  static const _kCardAspect = 63.0 / 88.0;
+  static const _kViewfinderWidth = 0.75;
+  // Extra height at the bottom so the bottom strip is fully captured.
+  static const _kBottomPadding = 0.03;
+
   ScannerController(this._repository) : super(const ScannerState());
 
   /// Initialises the camera and starts the image stream.
   ///
-  /// [screenSize] is used to map the on-screen viewfinder rect to native
-  /// camera coordinates so OCR is restricted to the card area.
+  /// [screenSize] is used to map the on-screen viewfinder rect to image
+  /// coordinates for post-OCR bounding-box filtering.
   Future<void> initialize(List<CameraDescription> cameras, Size screenSize) async {
     _screenSize = screenSize;
     // Prefer the back camera for card scanning.
@@ -105,7 +114,7 @@ class ScannerController extends StateNotifier<ScannerState> {
 
     _camera = CameraController(
       description,
-      // High gives ~1920×1080; the extra resolution is needed for the small
+      // High gives ~1920×1080; the extra resolution helps with the small
       // set-code / collector-number text at the bottom of the card.
       ResolutionPreset.high,
       enableAudio: false,
@@ -128,41 +137,64 @@ class ScannerController extends StateNotifier<ScannerState> {
 
     _lastSampleAt = now;
     _isProcessing = true;
-    debugPrint('[Scanner] ▶ frame sampled — ${image.width}×${image.height} fmt=${image.format.raw} planes=${image.planes.length}');
+    debugPrint('[Scanner] ▶ frame — ${image.width}×${image.height} fmt=${image.format.raw} planes=${image.planes.length}');
     _analyseFrame(image).whenComplete(() => _isProcessing = false);
   }
 
   Future<void> _analyseFrame(CameraImage image) async {
     final inputImage = _toInputImage(image);
     if (inputImage == null) {
-      debugPrint('[Scanner] ✗ _toInputImage returned null (unsupported format?)');
+      debugPrint('[Scanner] ✗ _toInputImage returned null');
       return;
     }
 
     final recognizedText = await _recognizer.processImage(inputImage);
-    final raw = recognizedText.text.trim();
 
-    if (raw.isEmpty) {
-      debugPrint('[Scanner] ~ OCR: (empty)');
+    if (recognizedText.blocks.isEmpty) {
+      debugPrint('[Scanner] ~ OCR: (no blocks)');
       _resetStability();
       return;
     }
 
-    // Print only the first 200 chars to keep logs readable.
-    //final preview = raw.length > 200 ? '${raw.substring(0, 200)}…' : raw;
-    debugPrint('[Scanner] OCR text:\n"""\n$raw\n"""');
+    // Log every block with its bounding box.  Compare bbox coordinates against
+    // image dimensions to confirm whether ML Kit returns native-image coords
+    // (x ≤ image.width, y ≤ image.height) or portrait-rotated coords.
+    for (final block in recognizedText.blocks) {
+      debugPrint('[Scanner] block bbox=${block.boundingBox} '
+          '"${block.text.trim().replaceAll('\n', '↵')}"');
+    }
 
-    final hints = OcrExtractor.extract(raw);
+    // Compute the viewfinder ROIs in native image coordinates.
+    // On iOS the sensor is landscape (sensorOrientation=90); ML Kit returns
+    // bounding boxes in the pre-rotation (native) coordinate space.
+    final roi = _viewfinderInNativeCoords(image);
+    final bottomRoi = _bottomStripInNativeCoords(image);
+    debugPrint('[Scanner] ROI native=$roi  bottomROI=$bottomRoi  img=${image.width}×${image.height}');
+
+    // Blocks inside the full viewfinder (for name extraction).
+    final mainText = _textsInRect(recognizedText.blocks, roi).join('\n').trim();
+
+    // Blocks inside the bottom strip (for set code + collector number).
+    final bottomText = _textsInRect(recognizedText.blocks, bottomRoi).join('\n').trim();
+
+    debugPrint('[Scanner] OCR main:\n"""\n$mainText\n"""');
+    debugPrint('[Scanner] OCR bottom:\n"""\n$bottomText\n"""');
+
+    if (mainText.isEmpty && bottomText.isEmpty) {
+      _resetStability();
+      return;
+    }
+
+    final hints = OcrExtractor.extractWithPriority(mainText, bottomText);
 
     if (hints == null) {
-      debugPrint('[Scanner] ~ OcrExtractor: no usable hints extracted');
+      debugPrint('[Scanner] ~ OcrExtractor: no usable hints');
       _resetStability();
       return;
     }
 
     debugPrint('[Scanner] hints → $hints');
 
-    // Accumulate consecutive readings of the same card.
     if (hints.matches(_candidateHints)) {
       _consecutiveCount++;
       debugPrint('[Scanner] stability: $_consecutiveCount/$_stabilityThreshold');
@@ -173,7 +205,6 @@ class ScannerController extends StateNotifier<ScannerState> {
     }
 
     if (_consecutiveCount >= _stabilityThreshold) {
-      // Stable reading detected — stop further processing and resolve.
       debugPrint('[Scanner] ✓ stable — calling resolve');
       final stable = _candidateHints!;
       _resetStability();
@@ -213,12 +244,15 @@ class ScannerController extends StateNotifier<ScannerState> {
     _consecutiveCount = 0;
   }
 
+  // ---------------------------------------------------------------------------
+  // Image conversion
+  // ---------------------------------------------------------------------------
+
   /// Converts a raw [CameraImage] to an [InputImage] for ML Kit.
   ///
-  /// For single-plane (BGRA / iOS) images the bytes are cropped to the
-  /// viewfinder region before passing to ML Kit, so OCR never sees content
-  /// outside the card frame.  Multi-plane (Android NV21) images are passed
-  /// whole; cropping NV21 planes is left as a future improvement.
+  /// The full frame is passed; ROI filtering is applied after OCR by examining
+  /// [TextBlock.boundingBox] values.  This avoids format-specific byte
+  /// manipulation and works for both NV12 (iOS) and NV21 (Android).
   InputImage? _toInputImage(CameraImage image) {
     if (_camera == null) return null;
 
@@ -234,45 +268,19 @@ class ScannerController extends StateNotifier<ScannerState> {
       return null;
     }
 
-    // iOS uses a single BGRA plane; Android NV21 uses two planes.
+    final Uint8List bytes;
     if (image.planes.length == 1) {
-      final src = image.planes[0].bytes;
-      final srcBytesPerRow = image.planes[0].bytesPerRow;
-      final crop = _viewfinderInNativeCoords(image);
-
-      if (crop != null) {
-        final cropW = (crop.right - crop.left).toInt();
-        final cropH = (crop.bottom - crop.top).toInt();
-        debugPrint('[Scanner] crop ${image.width}×${image.height} → $cropW×$cropH');
-        return InputImage.fromBytes(
-          bytes: _cropBgra(src, srcBytesPerRow, crop),
-          metadata: InputImageMetadata(
-            size: Size(cropW.toDouble(), cropH.toDouble()),
-            rotation: rotation,
-            format: format,
-            bytesPerRow: cropW * 4,
-          ),
-        );
+      bytes = image.planes[0].bytes;
+    } else {
+      final buffer = WriteBuffer();
+      for (final plane in image.planes) {
+        buffer.putUint8List(plane.bytes);
       }
-
-      return InputImage.fromBytes(
-        bytes: src,
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: format,
-          bytesPerRow: srcBytesPerRow,
-        ),
-      );
+      bytes = buffer.done().buffer.asUint8List();
     }
 
-    // Multi-plane path (Android NV21) — full image.
-    final buffer = WriteBuffer();
-    for (final plane in image.planes) {
-      buffer.putUint8List(plane.bytes);
-    }
     return InputImage.fromBytes(
-      bytes: buffer.done().buffer.asUint8List(),
+      bytes: bytes,
       metadata: InputImageMetadata(
         size: Size(image.width.toDouble(), image.height.toDouble()),
         rotation: rotation,
@@ -282,12 +290,27 @@ class ScannerController extends StateNotifier<ScannerState> {
     );
   }
 
-  /// Returns the viewfinder rectangle in native (sensor) image coordinates.
+  // ---------------------------------------------------------------------------
+  // ROI helpers
+  // ---------------------------------------------------------------------------
+
+  /// Returns the texts from [blocks] whose bounding boxes overlap [roi].
   ///
-  /// Works by inverting the [FittedBox.cover] transform used in the preview
-  /// widget, then mapping the resulting portrait-image rect to the native
-  /// landscape bytes via the sensor rotation.
-  Rect? _viewfinderInNativeCoords(CameraImage image) {
+  /// If [roi] is null every block's text is included (no filtering).
+  List<String> _textsInRect(List<TextBlock> blocks, Rect? roi) {
+    if (roi == null) return blocks.map((b) => b.text).toList();
+    return blocks
+        .where((b) => roi.overlaps(b.boundingBox))
+        .map((b) => b.text)
+        .toList();
+  }
+
+  /// Returns the viewfinder rectangle in portrait image coordinates
+  /// (the coordinate space of the image after the sensor rotation is applied).
+  ///
+  /// Inverts the [FittedBox.cover] transform used in [_buildCameraPreview]
+  /// and applies [_kBottomPadding] to capture the bottom strip.
+  Rect? _viewfinderPortraitRect(CameraImage image) {
     if (_screenSize == null || _camera == null) return null;
     final previewSize = _camera!.value.previewSize;
     if (previewSize == null) return null;
@@ -295,57 +318,62 @@ class ScannerController extends StateNotifier<ScannerState> {
     final screenW = _screenSize!.width;
     final screenH = _screenSize!.height;
 
-    // The preview widget swaps dimensions so the landscape sensor fills a
-    // portrait screen (matches _buildCameraPreview in scanner_screen.dart).
-    final portraitW = previewSize.height; // portrait display width
-    final portraitH = previewSize.width;  // portrait display height
+    // The preview widget swaps width↔height so the landscape sensor fills a
+    // portrait screen (see _buildCameraPreview in scanner_screen.dart).
+    final portraitW = previewSize.height;
+    final portraitH = previewSize.width;
 
-    // FittedBox.cover scale factor.
     final scale = math.max(screenW / portraitW, screenH / portraitH);
-
-    // Top-left corner of the (possibly overflowing) image in screen coords.
     final imgOriginX = (screenW - portraitW * scale) / 2;
     final imgOriginY = (screenH - portraitH * scale) / 2;
 
     // Viewfinder rect in screen coords (mirrors _VignettePainter).
-    const cardAspect = 63.0 / 88.0;
-    final cardWScreen = screenW * 0.75;
-    final cardHScreen = cardWScreen / cardAspect;
+    final cardWScreen = screenW * _kViewfinderWidth;
+    final cardHScreen = cardWScreen / _kCardAspect * (1 + _kBottomPadding);
     final cardLeftScreen = (screenW - cardWScreen) / 2;
     final cardTopScreen = (screenH - cardHScreen) / 2;
 
-    // Map screen coords → portrait image pixel coords.
+    // Map screen → portrait image pixel coords.
     final lp = (cardLeftScreen - imgOriginX) / scale;
     final tp = (cardTopScreen - imgOriginY) / scale;
     final rp = lp + cardWScreen / scale;
     final bp = tp + cardHScreen / scale;
 
-    // Clamp and round to integer portrait pixels.
     final l = lp.clamp(0.0, portraitW).round();
     final t = tp.clamp(0.0, portraitH).round();
     final r = rp.clamp(0.0, portraitW).round();
     final b = bp.clamp(0.0, portraitH).round();
 
     if (l >= r || t >= b) return null;
+    return Rect.fromLTRB(l.toDouble(), t.toDouble(), r.toDouble(), b.toDouble());
+  }
 
-    // Map portrait image coords → native (landscape) image coords.
-    // The mapping depends on the sensor's rotation relative to portrait.
-    //
-    // sensorOrientation=90  (typical iOS back camera):
-    //   portrait (xp,yp) → native (image.width-1-yp, xp)
-    // sensorOrientation=270 (some Android front cameras):
-    //   portrait (xp,yp) → native (yp, image.height-1-xp)
+  /// Maps a rectangle from portrait image coordinates to native (pre-rotation)
+  /// image coordinates based on the sensor orientation.
+  ///
+  /// ML Kit on iOS returns [TextBlock.boundingBox] in the native (landscape)
+  /// coordinate space of the bytes that were passed in.
+  Rect? _portraitRectToNative(Rect portrait, CameraImage image) {
+    if (_camera == null) return null;
     final wn = image.width;
     final hn = image.height;
+
+    final l = portrait.left.round();
+    final t = portrait.top.round();
+    final r = portrait.right.round();
+    final b = portrait.bottom.round();
+
     final int nl, nt, nr, nb;
 
     switch (_camera!.description.sensorOrientation) {
       case 90:
+        // portrait (xp,yp) → native (wn-1-yp, xp)
         nl = (wn - b).clamp(0, wn - 1);
         nt = l.clamp(0, hn - 1);
         nr = (wn - t).clamp(nl + 1, wn);
         nb = r.clamp(nt + 1, hn);
       case 270:
+        // portrait (xp,yp) → native (yp, hn-1-xp)
         nl = t.clamp(0, wn - 1);
         nt = (hn - r).clamp(0, hn - 1);
         nr = b.clamp(nl + 1, wn);
@@ -367,19 +395,27 @@ class ScannerController extends StateNotifier<ScannerState> {
     return Rect.fromLTRB(nl.toDouble(), nt.toDouble(), nr.toDouble(), nb.toDouble());
   }
 
-  /// Copies a rectangular sub-region from a BGRA (4 bytes/pixel) image buffer.
-  Uint8List _cropBgra(Uint8List src, int srcBytesPerRow, Rect crop) {
-    final x1 = crop.left.toInt();
-    final y1 = crop.top.toInt();
-    final w = (crop.right - crop.left).toInt();
-    final h = (crop.bottom - crop.top).toInt();
-    final dst = Uint8List(w * h * 4);
-    for (var row = 0; row < h; row++) {
-      final srcOff = (y1 + row) * srcBytesPerRow + x1 * 4;
-      final dstOff = row * w * 4;
-      dst.setRange(dstOff, dstOff + w * 4, src, srcOff);
-    }
-    return dst;
+  /// Full viewfinder rectangle in native image coordinates.
+  Rect? _viewfinderInNativeCoords(CameraImage image) {
+    final portrait = _viewfinderPortraitRect(image);
+    if (portrait == null) return null;
+    return _portraitRectToNative(portrait, image);
+  }
+
+  /// Bottom 18 % of the viewfinder in native image coordinates.
+  ///
+  /// This region tightly covers the bottom strip where the set code and
+  /// collector number are printed, giving OcrExtractor a cleaner input.
+  Rect? _bottomStripInNativeCoords(CameraImage image) {
+    final portrait = _viewfinderPortraitRect(image);
+    if (portrait == null) return null;
+    final strip = Rect.fromLTRB(
+      portrait.left,
+      portrait.bottom - portrait.height * 0.18,
+      portrait.right,
+      portrait.bottom,
+    );
+    return _portraitRectToNative(strip, image);
   }
 
   @override

@@ -1,6 +1,12 @@
 import 'package:flutter/material.dart';
 import '../scanner_controller.dart';
 
+// Viewfinder geometry constants — must stay in sync with the identically-named
+// constants in scanner_controller.dart (_kCardAspect, _kViewfinderWidth, _kBottomPadding).
+const _kCardAspect = 63.0 / 88.0;
+const _kViewfinderWidth = 0.75;
+const _kBottomPadding = 0.03;
+
 /// Transparent overlay drawn on top of the camera preview.
 ///
 /// Shows a card-shaped viewfinder rectangle and a status message
@@ -58,10 +64,10 @@ class ScanOverlay extends StatelessWidget {
 class _VignettePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
-    // Card aspect ratio ≈ 63 × 88 mm → ~0.716
-    const cardAspect = 63.0 / 88.0;
-    final cardW = size.width * 0.75;
-    final cardH = cardW / cardAspect;
+    final cardW = size.width * _kViewfinderWidth;
+    // Include the same bottom padding used by the OCR crop so the visual frame
+    // matches the area that is actually analysed.
+    final cardH = cardW / _kCardAspect * (1 + _kBottomPadding);
     final cardRect = RRect.fromRectAndRadius(
       Rect.fromCenter(
         center: Offset(size.width / 2, size.height / 2),
