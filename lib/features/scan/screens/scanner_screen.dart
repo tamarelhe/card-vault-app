@@ -44,7 +44,8 @@ class _ScannerScreenState extends ConsumerState<ScannerScreen> {
   Future<void> _initCamera() async {
     final cameras = await availableCameras();
     if (!mounted) return;
-    await ref.read(scannerControllerProvider.notifier).initialize(cameras);
+    final screenSize = MediaQuery.of(context).size;
+    await ref.read(scannerControllerProvider.notifier).initialize(cameras, screenSize);
   }
 
   @override

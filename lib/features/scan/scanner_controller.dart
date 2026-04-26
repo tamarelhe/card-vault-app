@@ -1,6 +1,7 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' show Size;
+import 'dart:ui' show Rect, Size;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show WriteBuffer, debugPrint;
@@ -74,6 +75,7 @@ class ScannerController extends StateNotifier<ScannerState> {
       TextRecognizer(script: TextRecognitionScript.latin);
 
   CameraController? _camera;
+  Size? _screenSize;
 
   bool _isProcessing = false;
   DateTime _lastSampleAt = DateTime.fromMillisecondsSinceEpoch(0);
@@ -90,7 +92,11 @@ class ScannerController extends StateNotifier<ScannerState> {
   ScannerController(this._repository) : super(const ScannerState());
 
   /// Initialises the camera and starts the image stream.
-  Future<void> initialize(List<CameraDescription> cameras) async {
+  ///
+  /// [screenSize] is used to map the on-screen viewfinder rect to native
+  /// camera coordinates so OCR is restricted to the card area.
+  Future<void> initialize(List<CameraDescription> cameras, Size screenSize) async {
+    _screenSize = screenSize;
     // Prefer the back camera for card scanning.
     final description = cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.back,
@@ -99,7 +105,9 @@ class ScannerController extends StateNotifier<ScannerState> {
 
     _camera = CameraController(
       description,
-      ResolutionPreset.medium, // balance quality vs. processing speed
+      // High gives ~1920×1080; the extra resolution is needed for the small
+      // set-code / collector-number text at the bottom of the card.
+      ResolutionPreset.high,
       enableAudio: false,
     );
 
@@ -141,8 +149,8 @@ class ScannerController extends StateNotifier<ScannerState> {
     }
 
     // Print only the first 200 chars to keep logs readable.
-    final preview = raw.length > 200 ? '${raw.substring(0, 200)}…' : raw;
-    debugPrint('[Scanner] OCR text:\n"""\n$preview\n"""');
+    //final preview = raw.length > 200 ? '${raw.substring(0, 200)}…' : raw;
+    debugPrint('[Scanner] OCR text:\n"""\n$raw\n"""');
 
     final hints = OcrExtractor.extract(raw);
 
@@ -206,6 +214,11 @@ class ScannerController extends StateNotifier<ScannerState> {
   }
 
   /// Converts a raw [CameraImage] to an [InputImage] for ML Kit.
+  ///
+  /// For single-plane (BGRA / iOS) images the bytes are cropped to the
+  /// viewfinder region before passing to ML Kit, so OCR never sees content
+  /// outside the card frame.  Multi-plane (Android NV21) images are passed
+  /// whole; cropping NV21 planes is left as a future improvement.
   InputImage? _toInputImage(CameraImage image) {
     if (_camera == null) return null;
 
@@ -222,19 +235,44 @@ class ScannerController extends StateNotifier<ScannerState> {
     }
 
     // iOS uses a single BGRA plane; Android NV21 uses two planes.
-    final Uint8List bytes;
     if (image.planes.length == 1) {
-      bytes = image.planes[0].bytes;
-    } else {
-      final buffer = WriteBuffer();
-      for (final plane in image.planes) {
-        buffer.putUint8List(plane.bytes);
+      final src = image.planes[0].bytes;
+      final srcBytesPerRow = image.planes[0].bytesPerRow;
+      final crop = _viewfinderInNativeCoords(image);
+
+      if (crop != null) {
+        final cropW = (crop.right - crop.left).toInt();
+        final cropH = (crop.bottom - crop.top).toInt();
+        debugPrint('[Scanner] crop ${image.width}×${image.height} → $cropW×$cropH');
+        return InputImage.fromBytes(
+          bytes: _cropBgra(src, srcBytesPerRow, crop),
+          metadata: InputImageMetadata(
+            size: Size(cropW.toDouble(), cropH.toDouble()),
+            rotation: rotation,
+            format: format,
+            bytesPerRow: cropW * 4,
+          ),
+        );
       }
-      bytes = buffer.done().buffer.asUint8List();
+
+      return InputImage.fromBytes(
+        bytes: src,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: format,
+          bytesPerRow: srcBytesPerRow,
+        ),
+      );
     }
 
+    // Multi-plane path (Android NV21) — full image.
+    final buffer = WriteBuffer();
+    for (final plane in image.planes) {
+      buffer.putUint8List(plane.bytes);
+    }
     return InputImage.fromBytes(
-      bytes: bytes,
+      bytes: buffer.done().buffer.asUint8List(),
       metadata: InputImageMetadata(
         size: Size(image.width.toDouble(), image.height.toDouble()),
         rotation: rotation,
@@ -242,6 +280,106 @@ class ScannerController extends StateNotifier<ScannerState> {
         bytesPerRow: image.planes[0].bytesPerRow,
       ),
     );
+  }
+
+  /// Returns the viewfinder rectangle in native (sensor) image coordinates.
+  ///
+  /// Works by inverting the [FittedBox.cover] transform used in the preview
+  /// widget, then mapping the resulting portrait-image rect to the native
+  /// landscape bytes via the sensor rotation.
+  Rect? _viewfinderInNativeCoords(CameraImage image) {
+    if (_screenSize == null || _camera == null) return null;
+    final previewSize = _camera!.value.previewSize;
+    if (previewSize == null) return null;
+
+    final screenW = _screenSize!.width;
+    final screenH = _screenSize!.height;
+
+    // The preview widget swaps dimensions so the landscape sensor fills a
+    // portrait screen (matches _buildCameraPreview in scanner_screen.dart).
+    final portraitW = previewSize.height; // portrait display width
+    final portraitH = previewSize.width;  // portrait display height
+
+    // FittedBox.cover scale factor.
+    final scale = math.max(screenW / portraitW, screenH / portraitH);
+
+    // Top-left corner of the (possibly overflowing) image in screen coords.
+    final imgOriginX = (screenW - portraitW * scale) / 2;
+    final imgOriginY = (screenH - portraitH * scale) / 2;
+
+    // Viewfinder rect in screen coords (mirrors _VignettePainter).
+    const cardAspect = 63.0 / 88.0;
+    final cardWScreen = screenW * 0.75;
+    final cardHScreen = cardWScreen / cardAspect;
+    final cardLeftScreen = (screenW - cardWScreen) / 2;
+    final cardTopScreen = (screenH - cardHScreen) / 2;
+
+    // Map screen coords → portrait image pixel coords.
+    final lp = (cardLeftScreen - imgOriginX) / scale;
+    final tp = (cardTopScreen - imgOriginY) / scale;
+    final rp = lp + cardWScreen / scale;
+    final bp = tp + cardHScreen / scale;
+
+    // Clamp and round to integer portrait pixels.
+    final l = lp.clamp(0.0, portraitW).round();
+    final t = tp.clamp(0.0, portraitH).round();
+    final r = rp.clamp(0.0, portraitW).round();
+    final b = bp.clamp(0.0, portraitH).round();
+
+    if (l >= r || t >= b) return null;
+
+    // Map portrait image coords → native (landscape) image coords.
+    // The mapping depends on the sensor's rotation relative to portrait.
+    //
+    // sensorOrientation=90  (typical iOS back camera):
+    //   portrait (xp,yp) → native (image.width-1-yp, xp)
+    // sensorOrientation=270 (some Android front cameras):
+    //   portrait (xp,yp) → native (yp, image.height-1-xp)
+    final wn = image.width;
+    final hn = image.height;
+    final int nl, nt, nr, nb;
+
+    switch (_camera!.description.sensorOrientation) {
+      case 90:
+        nl = (wn - b).clamp(0, wn - 1);
+        nt = l.clamp(0, hn - 1);
+        nr = (wn - t).clamp(nl + 1, wn);
+        nb = r.clamp(nt + 1, hn);
+      case 270:
+        nl = t.clamp(0, wn - 1);
+        nt = (hn - r).clamp(0, hn - 1);
+        nr = b.clamp(nl + 1, wn);
+        nb = (hn - l).clamp(nt + 1, hn);
+      case 0:
+        nl = l.clamp(0, wn - 1);
+        nt = t.clamp(0, hn - 1);
+        nr = r.clamp(nl + 1, wn);
+        nb = b.clamp(nt + 1, hn);
+      case 180:
+        nl = (wn - r).clamp(0, wn - 1);
+        nt = (hn - b).clamp(0, hn - 1);
+        nr = (wn - l).clamp(nl + 1, wn);
+        nb = (hn - t).clamp(nt + 1, hn);
+      default:
+        return null;
+    }
+
+    return Rect.fromLTRB(nl.toDouble(), nt.toDouble(), nr.toDouble(), nb.toDouble());
+  }
+
+  /// Copies a rectangular sub-region from a BGRA (4 bytes/pixel) image buffer.
+  Uint8List _cropBgra(Uint8List src, int srcBytesPerRow, Rect crop) {
+    final x1 = crop.left.toInt();
+    final y1 = crop.top.toInt();
+    final w = (crop.right - crop.left).toInt();
+    final h = (crop.bottom - crop.top).toInt();
+    final dst = Uint8List(w * h * 4);
+    for (var row = 0; row < h; row++) {
+      final srcOff = (y1 + row) * srcBytesPerRow + x1 * 4;
+      final dstOff = row * w * 4;
+      dst.setRange(dstOff, dstOff + w * 4, src, srcOff);
+    }
+    return dst;
   }
 
   @override
